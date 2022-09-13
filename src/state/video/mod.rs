@@ -237,8 +237,6 @@ impl Video {
                         .arg("-nostdin")
                         // TODO: Make audio extraction overwriting of existing files depend on argument
                         .arg("-y")
-                        .arg("-progress")
-                        .arg("pipe:1")
                         .arg("-i")
                         .arg(&source)
                         .arg(&destination)
@@ -292,7 +290,7 @@ impl Video {
         self: Arc<Self>,
         reader: A,
     ) -> Result<()> {
-        const BUF_SIZE: usize = 1024;
+        const BUF_SIZE: usize = 32; // TODO: What's a good size here?
 
         // Read from BufReader, replace \r (TODO: but not \r\n?!?) by \n and then feed back into tokio::io::util::Lines
 
@@ -313,9 +311,9 @@ impl Video {
                     while buf_reader.read_exact(&mut in_buf).await.is_ok() {
                         duplex_in
                             .write_all(
-                                in_buf
+                                std::mem::take(&mut in_buf)
                                     // TODO: Not sure if drain() reduces the length (not capacity) of the vector?
-                                    .drain(..)
+                                    .into_iter()
                                     .map(|byte| match byte {
                                         // We're doing all of this for you, ffmpeg.
                                         // No, we don't want your multiline progress report.
