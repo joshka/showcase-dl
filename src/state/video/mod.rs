@@ -6,16 +6,15 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::{path::Path, process::Stdio, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{RwLock, RwLockReadGuard},
-    task::JoinHandle,
 };
 use tracing::debug;
 
-use crate::util::maybe_join;
+use crate::util::maybe_await;
 
-use self::progress::ProgressDetail;
+use self::progress::DownloadProgressDetail;
 
 pub mod progress;
 
@@ -227,11 +226,19 @@ impl Video {
 
             debug!("Spawn: {cmd}");
             self.clone()
+                // TODO: Need a different read strategy. `-progress pipe:1` gives multi-line progress reports each second.
+                //       These need to be parsed or appended somehow to form a line.
+                //       Alternatively, if we work without
                 .child_read_to_end(
                     Command::new("ffmpeg")
                         .kill_on_drop(true)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
+                        .arg("-nostdin")
+                        // TODO: Make audio extraction overwriting of existing files depend on argument
+                        .arg("-y")
+                        .arg("-progress")
+                        .arg("pipe:1")
                         .arg("-i")
                         .arg(&source)
                         .arg(&destination)
@@ -241,8 +248,6 @@ impl Video {
                 .await?;
 
             self.set_stage_finished().await;
-
-            // TODO: Set stage finished
         }
 
         Ok(())
@@ -274,8 +279,8 @@ impl Video {
         };
 
         tokio::try_join!(
-            maybe_join(consume_stdout),
-            maybe_join(consume_stderr),
+            maybe_await(consume_stdout),
+            maybe_await(consume_stderr),
             await_exit,
         )
         .wrap_err("Could not join child consumers for stdout, stderr and awaiting child exit.")?;
@@ -283,32 +288,77 @@ impl Video {
         Ok(())
     }
 
-    fn consume_stream<A: AsyncRead + Unpin + Send + 'static>(
+    async fn consume_stream<A: AsyncRead + Unpin + Send + 'static>(
         self: Arc<Self>,
         reader: A,
-    ) -> JoinHandle<Result<()>> {
-        let mut lines = BufReader::new(reader).lines();
+    ) -> Result<()> {
+        const BUF_SIZE: usize = 1024;
 
-        let video = self;
-        tokio::spawn(async move {
-            while let Some(next_line) = lines.next_line().await? {
-                video
-                    .use_title(|title| {
-                        debug!(
-                            "Line from '{}': '{next_line}'",
-                            match *title {
-                                Some(ref title) => title,
-                                None => video.url(),
-                            }
-                        )
-                    })
-                    .await;
+        // Read from BufReader, replace \r (TODO: but not \r\n?!?) by \n and then feed back into tokio::io::util::Lines
 
-                video.update_line(next_line).await;
-            }
+        let mut buf_reader = BufReader::with_capacity(BUF_SIZE, reader);
 
-            Ok::<(), Report>(())
-        })
+        // Pipe the read bytes through a filter, replacing \r with \n.
+        // TODO: Is Duplex really the right type here? What other kinds of async pipes are there? I only need simplex (one way)!
+        let (mut duplex_in, duplex_out) = tokio::io::duplex(BUF_SIZE);
+
+        let mut lines = BufReader::new(duplex_out).lines();
+
+        tokio::try_join!(
+            async {
+                // Read from child process output and replace all b'\r' by b'\n',
+                // since we want to chunk by lines and use ffmpeg's default output.
+                tokio::spawn(async move {
+                    let mut in_buf = vec![0; BUF_SIZE];
+                    while buf_reader.read_exact(&mut in_buf).await.is_ok() {
+                        duplex_in
+                            .write_all(
+                                in_buf
+                                    // TODO: Not sure if drain() reduces the length (not capacity) of the vector?
+                                    .drain(..)
+                                    .map(|byte| match byte {
+                                        // We're doing all of this for you, ffmpeg.
+                                        // No, we don't want your multiline progress report.
+                                        b'\r' => b'\n',
+                                        b => b,
+                                    })
+                                    .collect::<Vec<u8>>()
+                                    .as_slice(),
+                            )
+                            .await?;
+                    }
+
+                    Ok::<(), Report>(())
+                })
+                .await?
+            },
+            async {
+                // Receive and process lines.
+                let video = self;
+                tokio::spawn(async move {
+                    while let Some(next_line) = lines.next_line().await? {
+                        video
+                            .use_title(|title| {
+                                debug!(
+                                    "Line from '{}': '{next_line}'",
+                                    match *title {
+                                        Some(ref title) => title,
+                                        None => video.url(),
+                                    }
+                                )
+                            })
+                            .await;
+
+                        video.update_line(next_line).await;
+                    }
+
+                    Ok::<(), Report>(())
+                })
+                .await?
+            },
+        )?;
+
+        Ok(())
     }
 
     // Acquire read guards for all fine-grained access-controlled fields.
@@ -337,7 +387,7 @@ impl<'a> VideoRead<'a> {
         &(*self.title)
     }
 
-    pub fn progress_detail(&'a self) -> Option<ProgressDetail<'a>> {
+    pub fn download_progress_detail(&'a self) -> Option<DownloadProgressDetail<'a>> {
         lazy_static! {
             static ref RE: Regex = Regex::new(
                 r#"^\[download\]\s+(?P<percent>[\d+\.]+?)% of (?P<size>~?[\d+\.]+?(?:[KMG]i)B)(?: at\s+(?P<speed>(?:~?[\d+\.]+?(?:[KMG]i)?|Unknown )B/s))?(?: ETA\s+(?P<eta>(?:[\d:-]+|Unknown)))?(?: \(frag (?P<frag>\d+)/(?P<frag_total>\d+)\))?"#,
@@ -368,7 +418,7 @@ impl<'a> VideoRead<'a> {
                         let frag_total = captures.name("frag_total").and_then(|frag_total_match| {
                             frag_total_match.as_str().parse::<u16>().ok()
                         });
-                        Some(ProgressDetail::Parsed {
+                        Some(DownloadProgressDetail::Parsed {
                             line,
                             percent,
                             size,
@@ -378,7 +428,7 @@ impl<'a> VideoRead<'a> {
                             frag_total,
                         })
                     }
-                    None => Some(ProgressDetail::Raw(line)),
+                    None => Some(DownloadProgressDetail::Raw(line)),
                 }
             }
             None => None,

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fmt::Display, ops::Range};
 
-pub enum ProgressDetail<'a> {
+pub enum DownloadProgressDetail<'a> {
     Raw(&'a str),
     Parsed {
         line: &'a str,
@@ -15,7 +15,7 @@ pub enum ProgressDetail<'a> {
     },
 }
 
-impl<'a> ProgressDetail<'a> {
+impl<'a> DownloadProgressDetail<'a> {
     pub fn to_table_cells(&self) -> Option<[Cow<'a, str>; 4]> {
         match self {
             Self::Raw(_) => None,
@@ -56,7 +56,7 @@ impl<'a> ProgressDetail<'a> {
     }
 }
 
-impl<'a> Display for ProgressDetail<'a> {
+impl<'a> Display for DownloadProgressDetail<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parsed {
@@ -88,7 +88,7 @@ impl<'a> Display for ProgressDetail<'a> {
                     write!(f, ". ")?;
                 }
             }
-            ProgressDetail::Raw(line) => write!(f, "{line}")?,
+            DownloadProgressDetail::Raw(line) => write!(f, "{line}")?,
         }
 
         Ok(())

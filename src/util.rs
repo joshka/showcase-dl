@@ -1,10 +1,11 @@
 use std::str::FromStr;
 
 use color_eyre::{eyre::Result, Report};
+use futures::Future;
 use reqwest::{header::HeaderValue, Client, Url};
-use tokio::task::JoinHandle;
 use tracing::debug;
 
+// Fetch a URL, applying a referer header
 pub async fn fetch_with_referer(url: &str, referer: &str) -> Result<String> {
     let referer_header_value = HeaderValue::from_str(referer)?;
     let url = Url::from_str(url)?;
@@ -28,9 +29,15 @@ pub async fn fetch_with_referer(url: &str, referer: &str) -> Result<String> {
     .await?
 }
 
+// Await the `impl Future` if the given `Option` is `Some(_)`
 #[inline]
-pub async fn maybe_join(maybe_spawned: Option<JoinHandle<Result<()>>>) -> Result<()> {
-    maybe_spawned.map(|join: JoinHandle<Result<()>>| async { join.await? });
+pub async fn maybe_await(
+    maybe_future: Option<impl Future<Output = Result<(), Report>>>,
+) -> Result<()> {
+    maybe_future.map(|fut| async {
+        fut.await?;
+        Ok::<(), Report>(())
+    });
 
     Ok(())
 }
